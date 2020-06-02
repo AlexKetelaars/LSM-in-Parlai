@@ -2014,8 +2014,8 @@ class TorchAgent(ABC, Agent):
             alpha.data -= 0.01 * alpha.grad.data
             if alpha.data > 1:
                 alpha.data = torch.Tensor([1])
-            if alpha.data < 0.000001:
-                alpha.data =  torch.Tensor([0])
+            if alpha.data < 0:
+                alpha.data =  torch.Tensor([0.000001])
             alpha.grad.data.zero_()
 
 
