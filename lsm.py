@@ -19,6 +19,7 @@ def word_function_dict():
 
 
 def LSM_loss_1(TGA, loss):
+    # LSM on golden response
 
     history = TGA.history.history_strings
 
@@ -31,7 +32,7 @@ def LSM_loss_1(TGA, loss):
     word_function_dict = TGA.word_function_dict
     functions = TGA.word_functions
 
-    lsm = compute_LSM_score(history, label, word_function_dict, functions)
+    lsm = compute_LSM_score_1(history, label, word_function_dict, functions)
 
     # learning rate
     alpha = 0.2
@@ -41,31 +42,7 @@ def LSM_loss_1(TGA, loss):
     return loss
 
 
-def LSM_loss_2(TGA, loss, preds):
-
-    history = TGA.history.history_strings
-
-    # Do not use LSM without context
-    if len(history) == 1 and history[0] == "__SILENCE__":
-        return loss
-
-    preds = [TGA._v2t(p) for p in preds][0]
-
-    word_function_dict = TGA.word_function_dict
-    functions = TGA.word_functions
-
-    lsm = compute_LSM_score(history, preds, word_function_dict, functions)
-
-    # learning rate
-    #alpha = Variable(torch.Tensor([TGA.lr_alpha]), requires_grad=True)
-    alpha = TGA.lr_alpha
-
-    # loss = (1 - alpha) * loss + alpha * 2 * (1 - lsm) * loss
-    loss = loss * (1 + alpha * (1 - 2 * lsm))
-    return loss
-
-
-def compute_LSM_score(history, label, word_function_dict, functions):
+def compute_LSM_score_1(history, label, word_function_dict, functions):
 
     history = reconstruct_history(history)
     label = reconstruct_string(label)
@@ -88,6 +65,74 @@ def compute_LSM_score(history, label, word_function_dict, functions):
 
     # TODO: Adding weight usage on history and/or functions
     lsm = np.mean(M)
+    return lsm
+
+
+def LSM_loss_2(TGA, loss, preds):
+    # LSM on proposed response
+
+    history = TGA.history.history_strings
+
+    # Do not use LSM without context
+    if len(history) == 1 and history[0] == "__SILENCE__":
+        return loss
+
+    label = TGA.observation["labels_choice"]
+    preds = [TGA._v2t(p) for p in preds][0]
+
+    word_function_dict = TGA.word_function_dict
+    functions = TGA.word_functions
+
+    lsm = compute_LSM_score_2(history, label, preds, word_function_dict, functions)
+
+    # learnable learning rate
+    alpha = TGA.lr_alpha
+
+    # loss = (1 - alpha) * loss + alpha * 2 * (1 - lsm) * loss
+    loss = loss * (1 + alpha * (1 - 2 * lsm))
+
+    return loss
+
+
+def compute_LSM_score_2(history, label, preds, word_function_dict, functions):
+
+    history = reconstruct_history(history)
+    label = reconstruct_string(label)
+    preds = reconstruct_string(preds)
+
+    M_label = []
+    M_preds = []
+    for f in functions:
+        function_words = word_function_dict[f]
+
+        # function-word count in history
+        hist_c = np.array([function_word_count(turn, function_words) for turn in history])
+
+        # function-word count in label
+        label_c = function_word_count(label, function_words)
+
+        # function-word count in preds
+        preds_c = function_word_count(preds, function_words)
+
+        # example lsm formula
+        lsm_score_label = 1 - np.absolute(hist_c - label_c) / (hist_c + label_c + 0.000001)
+        lsm_score_preds = 1 - np.absolute(hist_c - preds_c) / (hist_c + preds_c + 0.000001)
+
+        M_label.append(lsm_score_label)
+        M_preds.append(lsm_score_preds)
+
+    M_label = np.array(M_label)
+    M_preds = np.array(M_preds)
+
+    # function distance between label and preds
+    M = abs(M_label - M_preds)
+
+    # TODO: Adding weight usage on history and/or functions
+
+    # distance to lsm score
+    M = abs(1 - M)
+    lsm = np.mean(M)
+
     return lsm
 
 

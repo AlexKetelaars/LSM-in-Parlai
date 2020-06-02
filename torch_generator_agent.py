@@ -41,6 +41,7 @@ from parlai.utils.torch import (
 )
 
 from parlai.core.lsm import LSM_loss_1, LSM_loss_2, word_function_dict
+from torch.autograd import Variable
 
 try:
     from nltk.translate import bleu_score as nltkbleu
@@ -438,7 +439,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         self.word_function_dict = word_function_dict()
         self.word_functions = ["adverbs", "articles", "auxiliary_verbs", "conjunctions",\
                                "impersonal_pronouns", "prepositions", "quantifiers"]
-        self.lr_alpha = 0.2
+        self.lr_alpha = Variable(torch.Tensor([0.2]), requires_grad=True)
 
 
         if shared:

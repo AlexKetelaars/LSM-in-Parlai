@@ -2005,6 +2005,19 @@ class TorchAgent(ABC, Agent):
             self.optimizer.backward(loss, update_master_grads=False)
         else:
             loss.backward()
+            alpha = self.lr_alpha
+
+            # Skip due to __SILENCE__
+            if alpha.grad == None:
+                return
+
+            alpha.data -= 0.01 * alpha.grad.data
+            if alpha.data > 1:
+                alpha.data = torch.Tensor([1])
+            if alpha.data < 0.000001:
+                alpha.data =  torch.Tensor([0])
+            alpha.grad.data.zero_()
+
 
     def update_params(self):
         """
