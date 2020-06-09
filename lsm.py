@@ -18,6 +18,22 @@ def word_function_dict():
     return d
 
 
+def word_function_dict_by_id(dictionary):
+    """Add the vocabulary id of functional words by Prof. Fernandez to dictionary."""
+    path="function_words/"
+    word_functions = ["adverbs", "articles", "auxiliary_verbs", "conjunctions",\
+                 "impersonal_pronouns", "prepositions", "quantifiers"]
+    d = {}
+    for word_function in word_functions:
+        d[word_function] = []
+        with open(path + word_function + ".txt", "r") as f:
+            for word in f.read().splitlines():
+                idx = dictionary[word]
+                if idx != 3:
+                    d[word_function] += [idx]
+    return d
+
+
 def LSM_loss_1(TGA, loss):
     # LSM on golden response
 
@@ -35,9 +51,10 @@ def LSM_loss_1(TGA, loss):
     lsm = compute_LSM_score_1(history, label, word_function_dict, functions)
 
     # learning rate
+    #alpha = TGA.lr_alpha
     alpha = 0.2
 
-    loss = (1 - alpha) * loss + alpha * 2 * (1 - lsm) * loss
+    loss = loss * (1 + alpha * (1 - 2 * lsm))
 
     return loss
 
@@ -153,3 +170,74 @@ def reconstruct_string(s):
     s = s.replace("'", " '")
     s = s.split()
     return s
+
+
+def LSM_beam_score(BS, scores, lsm_dict):
+    print("---LSM---")
+
+
+    #skip initialisation
+    scores = scores.tolist()
+    if len(scores) <= 1:
+        return torch.tensor(scores)
+
+
+    context = BS.context
+    context_lsm_scores, _ = LSM_scores_from_idxs(context, lsm_dict)
+
+    # List of current beam sentences
+    beam_sentences = []
+    for i in range(BS.beam_size):
+        beam_sentence = []
+        for output in BS.outputs:
+            beam_sentence.append(output[i].tolist())
+        beam_sentences += [beam_sentence]
+
+
+    function_list = []
+    sentence_lsm_scores = []
+    for beam_sentence in beam_sentences:
+        sentence_lsm_score, functions = LSM_scores_from_idxs(beam_sentence, lsm_dict)
+        sentence_lsm_scores += [sentence_lsm_score]
+        function_list += [functions]
+
+    S = np.array(sentence_lsm_scores)
+    F = np.array(function_list)
+    C = np.array(context_lsm_scores)
+    Cstack = np.vstack([C]*BS.beam_size)
+
+    M = S / (C + 0.000001)
+
+    # iterate over beam index with y
+    for y in range(len(F)):
+        for x in range(len(F[i])):
+            word_function = F[y,x]
+            function_idxs = lsm_dict[word_function]
+            lsm_score = M[y,x]
+
+            for idx in function_idxs:
+
+                # TODO: Fix lsm score
+                scores[y][idx] = lsm_score
+                continue
+
+
+    scores = torch.tensor(scores)
+    print(scores)
+    print(scores.shape)
+    print("---End LSM---")
+    return scores
+
+
+def LSM_scores_from_idxs(l, lsm_dict):
+    length = len(l)
+    scores = []
+    functions = []
+    for function, indices in lsm_dict.items():
+        functions += [function]
+        f_count = 0
+        for t in l:
+            if t in indices:
+                f_count += 1
+        scores += [f_count / length]
+    return scores, functions

@@ -41,6 +41,7 @@ from parlai.utils.torch import (
 )
 
 from parlai.core.lsm import LSM_loss_1, LSM_loss_2, word_function_dict
+from parlai.core.lsm import LSM_beam_score, word_function_dict_by_id
 from torch.autograd import Variable
 
 try:
@@ -435,10 +436,14 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         self.compute_tokenized_bleu = opt.get('compute_tokenized_bleu', False)
         self.beam_blacklist: Optional[SearchBlacklist] = None
 
-        print("--- adding PoS--- ")
+        #print("--- adding PoS--- ")
         self.word_function_dict = word_function_dict()
         self.word_functions = ["adverbs", "articles", "auxiliary_verbs", "conjunctions",\
                                "impersonal_pronouns", "prepositions", "quantifiers"]
+
+        self.word_function_dict_by_id = word_function_dict_by_id(self.dict)
+
+
         self.lr_alpha = Variable(torch.Tensor([0.2]), requires_grad=True)
 
 
@@ -677,6 +682,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         """
         Train on a single batch of examples.
         """
+
         # helps with memory usage
         # note we want to use the opt's batchsize instead of the observed batch size
         # in case dynamic batching is in use
@@ -686,8 +692,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
 
         try:
             loss, (_, preds, _) = self.compute_loss(batch, True)
-            #loss = LSM_loss_1(self, loss)
-            loss = LSM_loss_2(self, loss, preds)
+            loss = LSM_loss_1(self, loss)
+            #loss = LSM_loss_2(self, loss, preds)
             self.backward(loss)
             self.update_params()
         except RuntimeError as e:
@@ -790,6 +796,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         """
         Evaluate a single batch of examples.
         """
+
         if batch.text_vec is None and batch.image is None:
             return
         if batch.text_vec is not None:
@@ -819,8 +826,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             beam_preds_scores, _ = self._generate(batch, self.beam_size, maxlen)
             preds, scores = zip(*beam_preds_scores)
 
-        print("preds:", preds)
-        print("scores:", scores)
+        #print("preds:", preds)
+        #print("scores:", scores)
 
         cand_choices = None
         # TODO: abstract out the scoring here
@@ -932,6 +939,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
 
     def _generate(self, batch, beam_size, max_ts):
         """
+
         Generate an output with beam search.
 
         Depending on the options, this may perform greedy/topk/nucleus generation.
@@ -953,6 +961,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             - beams :list of Beam instances defined in Beam class, can be used for any
               following postprocessing, e.g. dot logging.
         """
+        print("\n-------------------------------------\n")
+
         model = self.model
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model = self.model.module
@@ -984,18 +994,31 @@ class TorchGeneratorAgent(TorchAgent, ABC):
         )
 
         inds = torch.arange(bsz).to(dev).unsqueeze(1).repeat(1, beam_size).view(-1)
+
+        # all 300 encoder states... for each combination of beam-indice and history word
         encoder_states = model.reorder_encoder_states(encoder_states, inds)
+
         incr_state = None
 
         for _ts in range(max_ts):
+
             if all((b.is_done() for b in beams)):
                 # exit early if possible
                 break
 
+            print(decoder_input)
+
             score, incr_state = model.decoder(decoder_input, encoder_states, incr_state)
+
+            print(score.shape)
+
             # only need the final hidden state to make the word prediction
             score = score[:, -1:, :]
+
             score = model.output(score)
+
+            print(score.shape)
+
             # score contains softmax scores for bsz * beam_size samples
             score = score.view(bsz, beam_size, -1)
             if self.temperature != 1.0:
@@ -1004,7 +1027,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             score = F.log_softmax(score, dim=-1, dtype=torch.float32)
             for i, b in enumerate(beams):
                 if not b.is_done():
-                    b.advance(score[i])
+                    b.my_advance(self, score[i])
             incr_state_inds = torch.cat(
                 [
                     beam_size * i + b.get_backtrack_from_current_step()
@@ -1014,14 +1037,21 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             incr_state = model.reorder_decoder_incremental_state(
                 incr_state, incr_state_inds
             )
+
             decoder_input = torch.index_select(decoder_input, 0, incr_state_inds)
+
             selection = torch.cat(
                 [b.get_output_from_current_step() for b in beams]
             ).unsqueeze(-1)
             decoder_input = torch.cat([decoder_input, selection], dim=-1)
+            
 
         # get all finalized candidates for each sample (and validate them)
         n_best_beam_preds_scores = [b.get_rescored_finished() for b in beams]
+
+        # for i, beams in enumerate(n_best_beam_preds_scores):
+        #     for b, (tokens, score) in enumerate(beams):
+        #         print(self._v2t(tokens))
 
         if hasattr(self, '_rerank_beams'):
             n_best_beam_preds_scores = self._rerank_beams(
@@ -1030,6 +1060,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
 
         # get the top prediction for each beam (i.e. minibatch sample)
         beam_preds_scores = [n_best_list[0] for n_best_list in n_best_beam_preds_scores]
+
         if self.opt.get('verbose'):
             for i, beams in enumerate(n_best_beam_preds_scores):
                 for b, (tokens, score) in enumerate(beams):
@@ -1235,10 +1266,18 @@ class TreeSearch(object):
                         logprobs[beam_id][ngram[-1]] = neginf(logprobs.dtype)
         return logprobs
 
-    def advance(self, logprobs):
+    def my_advance(self, TGA, logprobs):
         """
         Advance the beam one step.
         """
+
+        print("----advance----")
+        #print(self.all_scores)
+        #print(self.scores)
+        #print(logprobs.shape)
+        #print(self.context)
+        #print([(i, o) for i, o in enumerate(self.outputs[-1])])
+
         current_length = len(self.all_scores) - 1
         if current_length < self.min_length:
             # penalize all eos probs to make it decode longer
@@ -1247,6 +1286,7 @@ class TreeSearch(object):
 
         if self.scores is None:
             self.scores = torch.zeros(1).type_as(logprobs).to(logprobs.device)
+
 
         # penalize hypotheses ending in EOS on the prior scores (self.scores) level
         # this is related to search which uses prior scores (self.scores) (e.g. beam)
@@ -1258,8 +1298,87 @@ class TreeSearch(object):
         if self.block_ngram > 0:
             logprobs = self._block_ngrams(self.block_ngram, logprobs, None)
 
+        # block blacklist by changing logprobs to neginf
         logprobs = self._block_blacklist(logprobs)
 
+        # context blocking
+        if self.context_block_ngram > 0:
+            if self.context is None:
+                raise ValueError(
+                    "Must use TreeSearch.set_context to use context blocking."
+                )
+            logprobs = self._block_ngrams(
+                self.context_block_ngram, logprobs, self.context
+            )
+
+        print("Logit Probabilities:", logprobs.shape)
+        print("Prior Scores:", self.scores)
+        print("Current Sentence Length:", current_length)
+
+        hyp_ids, tok_ids, self.scores = self.my_select_paths(TGA, 
+            logprobs, self.scores, current_length
+        )
+        # use clone() here to ensure that self.all_scores will not be changed
+        # later due to any penalties to self.scores
+        self.all_scores.append(self.scores.clone())
+
+        self.outputs.append(tok_ids)
+        self.bookkeep.append(hyp_ids)
+        self.partial_hyps = [
+            self.partial_hyps[hyp_ids[i]] + [tok_ids[i].item()]
+            for i in range(self.beam_size)
+        ]
+
+        #  check new hypos for eos label, if we have some, add to finished
+        for hypid in range(self.beam_size):
+            if self.outputs[-1][hypid] == self.eos:
+                if self.scores[hypid] <= neginf(self.scores.dtype):
+                    continue
+                #  this is finished hypo, adding to finished
+                eostail = _HypothesisTail(
+                    timestep=len(self.outputs) - 1,
+                    hypid=hypid,
+                    score=self.all_scores[-1][hypid],
+                    tokenid=self.eos,
+                )
+                self.finished.append(eostail)
+                self.n_best_counter += 1
+
+        if self.outputs[-1][0] == self.eos:
+            self.eos_top = True
+            if self.eos_top_ts is None:
+                self.eos_top_ts = len(self.outputs) - 1
+
+
+    def advance(self, logprobs):
+        """
+        Advance the beam one step.
+        """
+
+        current_length = len(self.all_scores) - 1
+        if current_length < self.min_length:
+            # penalize all eos probs to make it decode longer
+            for hyp_id in range(logprobs.size(0)):
+                logprobs[hyp_id][self.eos] = neginf(logprobs.dtype)
+
+        if self.scores is None:
+            self.scores = torch.zeros(1).type_as(logprobs).to(logprobs.device)
+
+
+        # penalize hypotheses ending in EOS on the prior scores (self.scores) level
+        # this is related to search which uses prior scores (self.scores) (e.g. beam)
+        for hyp_id, token in enumerate(self.outputs[-1]):
+            if token == self.eos:
+                self.scores[hyp_id] = neginf(self.scores.dtype)
+
+        # beam blocking
+        if self.block_ngram > 0:
+            logprobs = self._block_ngrams(self.block_ngram, logprobs, None)
+
+        # block blacklist by changing logprobs to neginf
+        logprobs = self._block_blacklist(logprobs)
+
+        # context blocking
         if self.context_block_ngram > 0:
             if self.context is None:
                 raise ValueError(
@@ -1302,6 +1421,7 @@ class TreeSearch(object):
             self.eos_top = True
             if self.eos_top_ts is None:
                 self.eos_top_ts = len(self.outputs) - 1
+
 
     def is_done(self):
         """
@@ -1440,10 +1560,48 @@ class BeamSearch(TreeSearch):
     Beam search.
     """
 
+    def my_select_paths(self, TGA, logprobs, prior_scores, current_length):
+        """
+        Select the next vocabulary item in these beams.
+        """
+
+        print("\n--------select path--------\n")
+
+        # if numel is 1, then this is the first time step, only one hyp is expanded
+        if prior_scores.numel() == 1:
+            logprobs = logprobs[0:1]
+
+
+        # beam search actually looks over all hypotheses together so we flatten
+        prior_scores_exp = prior_scores.unsqueeze(1).expand_as(logprobs)
+
+        # function word index dictionary
+        lsm_dict = TGA.word_function_dict_by_id
+
+        # Change expanded prior scores based on lsm score
+        prior_scores_LSM = LSM_beam_score(self, prior_scores_exp, lsm_dict)
+        
+
+        beam_scores = logprobs + prior_scores_LSM
+        flat_beam_scores = beam_scores.view(-1)
+        best_scores, best_idxs = torch.topk(flat_beam_scores, self.beam_size, dim=-1)
+        voc_size = logprobs.size(-1)
+
+        # get the backtracking hypothesis id as a multiple of full voc_sizes
+        hyp_ids = best_idxs / voc_size
+        # get the actual word id from residual of the same division
+        tok_ids = best_idxs % voc_size
+
+        print("------end path------")
+
+        return (hyp_ids, tok_ids, best_scores)
+
+
     def select_paths(self, logprobs, prior_scores, current_length):
         """
         Select the next vocabulary item in these beams.
         """
+
         # if numel is 1, then this is the first time step, only one hyp is expanded
         if prior_scores.numel() == 1:
             logprobs = logprobs[0:1]
