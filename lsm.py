@@ -34,28 +34,40 @@ def word_function_dict_by_id(dictionary):
     return d
 
 
-def LSM_loss_1(TGA, loss):
+def LSM_loss_1(TGA, batch, loss):
     # LSM on golden response
 
-    history = TGA.history.history_strings
+    losses = []
 
-    # Do not use LSM without context
-    if len(history) == 1 and history[0] == "__SILENCE__":
-        return loss
+    # Iterate over batches
+    for b in batch.observations:
 
-    label = TGA.observation["labels_choice"]
+        # Get batch history
+        history = b["full_text"].split("\n")
 
-    word_function_dict = TGA.word_function_dict
-    functions = TGA.word_functions
+        # Do not use LSM without context
+        if len(history) == 1 and history[0] == "__SILENCE__":
+            losses += [loss]
+            continue
 
-    lsm = compute_LSM_score_1(history, label, word_function_dict, functions)
+        # Get batch golden response
+        label = b["labels_choice"]
 
-    # learning rate
-    #alpha = TGA.lr_alpha
-    alpha = 0.2
+        word_function_dict = TGA.word_function_dict
+        functions = TGA.word_functions
 
-    loss = loss * (1 + alpha * (1 - 2 * lsm))
+        lsm = compute_LSM_score_1(history, label, word_function_dict, functions)
 
+        # learning rate
+        #alpha = TGA.lr_alpha
+        alpha = 0.2
+
+        loss = loss * (1 + alpha * (1 - 2 * lsm))
+
+        losses += [loss]
+
+    # Average Batch loss
+    loss = torch.mean(torch.stack(losses))
     return loss
 
 
@@ -172,41 +184,44 @@ def reconstruct_string(s):
     return s
 
 
-def LSM_beam_score(BS, scores, lsm_dict):
-    print("---LSM---")
-
+def LSM_beam_score(scores, lsm_dict, context, outputs, beam_size, device):
 
     #skip initialisation
-    scores = scores.tolist()
-    if len(scores) <= 1:
-        return torch.tensor(scores)
+    new_scores = scores.tolist()
+    if len(new_scores) <= 1:
+        return scores
 
+    # Skip contextless dialogue
+    context = context
+    if len(context) <= 1:
+        return scores
 
-    context = BS.context
     context_lsm_scores, _ = LSM_scores_from_idxs(context, lsm_dict)
 
     # List of current beam sentences
     beam_sentences = []
-    for i in range(BS.beam_size):
+    for i in range(beam_size):
         beam_sentence = []
-        for output in BS.outputs:
+        for output in outputs:
             beam_sentence.append(output[i].tolist())
         beam_sentences += [beam_sentence]
 
 
+    # Find the lsm-score for each function in each beam 
     function_list = []
-    sentence_lsm_scores = []
+    beam_lsm_scores = []
     for beam_sentence in beam_sentences:
-        sentence_lsm_score, functions = LSM_scores_from_idxs(beam_sentence, lsm_dict)
-        sentence_lsm_scores += [sentence_lsm_score]
+        beam_lsm_score, functions = LSM_scores_from_idxs(beam_sentence, lsm_dict)
+        beam_lsm_scores += [beam_lsm_score]
         function_list += [functions]
 
-    S = np.array(sentence_lsm_scores)
     F = np.array(function_list)
+    B = np.array(beam_lsm_scores)
     C = np.array(context_lsm_scores)
-    Cstack = np.vstack([C]*BS.beam_size)
+    Cstack = np.vstack([C]*beam_size)
 
-    M = S / (C + 0.000001)
+    # Calculate LSM scores
+    M = (Cstack - B) / (np.abs(Cstack + B) + 0.000001)
 
     # iterate over beam index with y
     for y in range(len(F)):
@@ -216,16 +231,16 @@ def LSM_beam_score(BS, scores, lsm_dict):
             lsm_score = M[y,x]
 
             for idx in function_idxs:
+                new_scores[y][idx] += abs(new_scores[y][idx]) * lsm_score
 
-                # TODO: Fix lsm score
-                scores[y][idx] = lsm_score
-                continue
+    new_scores = torch.tensor(new_scores, device=torch.device(device))
 
+    #alpha = TGA.lr_alpha
+    alpha = 0.2
 
-    scores = torch.tensor(scores)
-    print(scores)
-    print(scores.shape)
-    print("---End LSM---")
+    # Change Score based on alpha
+    scores = (1 - alpha) * scores + alpha * new_scores
+
     return scores
 
 
@@ -241,3 +256,11 @@ def LSM_scores_from_idxs(l, lsm_dict):
                 f_count += 1
         scores += [f_count / length]
     return scores, functions
+
+
+def document_loss(path, loss):
+    if path != None:
+        f = open(path + '_loss_documentation.txt', "a")
+        f.write(str(loss.item()) + '\n')
+        f.close()
+    return

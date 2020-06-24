@@ -42,6 +42,7 @@ from parlai.utils.torch import (
 
 from parlai.core.lsm import LSM_loss_1, LSM_loss_2, word_function_dict
 from parlai.core.lsm import LSM_beam_score, word_function_dict_by_id
+from parlai.core.lsm import document_loss
 from torch.autograd import Variable
 
 try:
@@ -417,6 +418,12 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             help='if true, compute tokenized bleu scores',
         )
 
+        agent.add_argument(
+            '--lossdoc',
+            type=str,
+            default=None,
+        )
+
         super(TorchGeneratorAgent, cls).add_cmdline_args(argparser)
         return agent
 
@@ -442,6 +449,7 @@ class TorchGeneratorAgent(TorchAgent, ABC):
                                "impersonal_pronouns", "prepositions", "quantifiers"]
 
         self.word_function_dict_by_id = word_function_dict_by_id(self.dict)
+        self.loss_documentation_path = opt.get('lossdoc')
 
 
         self.lr_alpha = Variable(torch.Tensor([0.2]), requires_grad=True)
@@ -692,7 +700,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
 
         try:
             loss, (_, preds, _) = self.compute_loss(batch, True)
-            loss = LSM_loss_1(self, loss)
+            #loss = LSM_loss_1(self, batch, loss)
+            document_loss(self.loss_documentation_path, loss)
             #loss = LSM_loss_2(self, loss, preds)
             self.backward(loss)
             self.update_params()
@@ -961,7 +970,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             - beams :list of Beam instances defined in Beam class, can be used for any
               following postprocessing, e.g. dot logging.
         """
-        print("\n-------------------------------------\n")
+
+        lsm_dict = self.word_function_dict_by_id
 
         model = self.model
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -997,6 +1007,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
 
         # all 300 encoder states... for each combination of beam-indice and history word
         encoder_states = model.reorder_encoder_states(encoder_states, inds)
+        #print(encoder_states[0].shape)
+        #print(batch.observations[0]['full_text'])
 
         incr_state = None
 
@@ -1006,18 +1018,13 @@ class TorchGeneratorAgent(TorchAgent, ABC):
                 # exit early if possible
                 break
 
-            print(decoder_input)
-
             score, incr_state = model.decoder(decoder_input, encoder_states, incr_state)
-
-            print(score.shape)
-
+ 
             # only need the final hidden state to make the word prediction
+            
             score = score[:, -1:, :]
 
             score = model.output(score)
-
-            print(score.shape)
 
             # score contains softmax scores for bsz * beam_size samples
             score = score.view(bsz, beam_size, -1)
@@ -1027,7 +1034,8 @@ class TorchGeneratorAgent(TorchAgent, ABC):
             score = F.log_softmax(score, dim=-1, dtype=torch.float32)
             for i, b in enumerate(beams):
                 if not b.is_done():
-                    b.my_advance(self, score[i])
+                    #b.advance(score[i])
+                    b.my_advance(lsm_dict, score[i])
             incr_state_inds = torch.cat(
                 [
                     beam_size * i + b.get_backtrack_from_current_step()
@@ -1266,12 +1274,11 @@ class TreeSearch(object):
                         logprobs[beam_id][ngram[-1]] = neginf(logprobs.dtype)
         return logprobs
 
-    def my_advance(self, TGA, logprobs):
+    def my_advance(self, lsm_dict, logprobs):
         """
         Advance the beam one step.
         """
-
-        print("----advance----")
+        
         #print(self.all_scores)
         #print(self.scores)
         #print(logprobs.shape)
@@ -1311,11 +1318,11 @@ class TreeSearch(object):
                 self.context_block_ngram, logprobs, self.context
             )
 
-        print("Logit Probabilities:", logprobs.shape)
-        print("Prior Scores:", self.scores)
-        print("Current Sentence Length:", current_length)
+        #print("Logit Probabilities:", logprobs.shape)
+        #print("Prior Scores:", self.scores)
+        #print("Current Sentence Length:", current_length)
 
-        hyp_ids, tok_ids, self.scores = self.my_select_paths(TGA, 
+        hyp_ids, tok_ids, self.scores = self.my_select_paths(lsm_dict, 
             logprobs, self.scores, current_length
         )
         # use clone() here to ensure that self.all_scores will not be changed
@@ -1560,29 +1567,26 @@ class BeamSearch(TreeSearch):
     Beam search.
     """
 
-    def my_select_paths(self, TGA, logprobs, prior_scores, current_length):
+    def my_select_paths(self, lsm_dict, logprobs, prior_scores, current_length):
         """
         Select the next vocabulary item in these beams.
         """
 
-        print("\n--------select path--------\n")
-
         # if numel is 1, then this is the first time step, only one hyp is expanded
         if prior_scores.numel() == 1:
-            logprobs = logprobs[0:1]
-
+            logprobs = logprobs[0:1]    
 
         # beam search actually looks over all hypotheses together so we flatten
-        prior_scores_exp = prior_scores.unsqueeze(1).expand_as(logprobs)
+        beam_scores = logprobs + prior_scores.unsqueeze(1).expand_as(logprobs)
 
-        # function word index dictionary
-        lsm_dict = TGA.word_function_dict_by_id
+        context = self.context
+        beam_size = self.beam_size
+        outputs = self.outputs
+        device = self.device
 
-        # Change expanded prior scores based on lsm score
-        prior_scores_LSM = LSM_beam_score(self, prior_scores_exp, lsm_dict)
-        
+        # Change beam scores based on lsm score
+        beam_scores = LSM_beam_score(beam_scores, lsm_dict, context, outputs, beam_size, device)
 
-        beam_scores = logprobs + prior_scores_LSM
         flat_beam_scores = beam_scores.view(-1)
         best_scores, best_idxs = torch.topk(flat_beam_scores, self.beam_size, dim=-1)
         voc_size = logprobs.size(-1)
@@ -1591,8 +1595,6 @@ class BeamSearch(TreeSearch):
         hyp_ids = best_idxs / voc_size
         # get the actual word id from residual of the same division
         tok_ids = best_idxs % voc_size
-
-        print("------end path------")
 
         return (hyp_ids, tok_ids, best_scores)
 
