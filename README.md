@@ -3,12 +3,16 @@
 These files are part of the ParlAI framework. In order do use the code, they need to be implemented in the framework as follows:
 
 Substitute the following files with this version:
-
+```
   parlai/core/torch_generator_agent.py
   parlai/core/torch_agent.py
+```
+
   
 Add the lsm file to the same directory:
+```
   parlai/core/lsm.py
+```
   
 In order to run the baseline and any of the objective models, the model can be run as follows:
   python -u ParlAI/examples/train_model.py \
